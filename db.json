@@ -1,0 +1,7 @@
+{
+  "projects": [
+    { "id": 1, "name": "TaskFlow", "status": "ACTIVE", "owner": "Antoniu", "budget": 1200, "spent": 400, "createdAt": "2025-12-01" },
+    { "id": 2, "name": "Real-time Chat", "status": "ACTIVE", "owner": "Antoniu", "budget": 900, "spent": 250, "createdAt": "2026-01-05" },
+    { "id": 3, "name": "Mini Booking", "status": "PAUSED", "owner": "Antoniu", "budget": 600, "spent": 500, "createdAt": "2025-11-10" }
+  ]
+}
