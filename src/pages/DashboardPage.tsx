@@ -1,371 +1,421 @@
-import { useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createProject, deleteProject, listProjects } from "../api/projects";
-import type { ProjectStatus } from "../types/project";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
-import {
-  PieChart,
-  Pie,
-  Tooltip,
-  ResponsiveContainer,
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Legend,
-} from "recharts";
 
-const schema = z.object({
-  name: z.string().min(2, "Name too short"),
-  owner: z.string().min(2, "Owner too short"),
+import type { Project, ProjectStatus } from "../types/project";
+import { calculateKPIs, type KPI } from "../api/kpis";
+import ChartsPanel from "../components/ChartsPanel";
+
+const API_URL = "http://localhost:8081/projects";
+
+type SortKey = "createdAt" | "name" | "owner" | "budget" | "spent" | "status";
+type SortDir = "asc" | "desc";
+
+const statusOptions: Array<{ label: string; value: "ALL" | ProjectStatus }> = [
+  { label: "All statuses", value: "ALL" },
+  { label: "ACTIVE", value: "ACTIVE" },
+  { label: "PAUSED", value: "PAUSED" },
+  { label: "DONE", value: "DONE" },
+];
+
+const sortOptions: Array<{ label: string; value: SortKey }> = [
+  { label: "created date", value: "createdAt" },
+  { label: "name", value: "name" },
+  { label: "owner", value: "owner" },
+  { label: "status", value: "status" },
+  { label: "budget", value: "budget" },
+  { label: "spent", value: "spent" },
+];
+
+const projectSchema = z.object({
+  name: z.string().trim().min(2, "Name is required (min 2 chars)"),
+  owner: z.string().trim().min(2, "Owner is required (min 2 chars)"),
   status: z.enum(["ACTIVE", "PAUSED", "DONE"]),
-  budget: z.coerce.number().min(0),
-  spent: z.coerce.number().min(0),
+  budget: z.coerce.number().min(0, "Budget must be >= 0"),
+  spent: z.coerce.number().min(0, "Spent must be >= 0"),
+  createdAt: z
+    .string()
+    .trim()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD"),
 });
 
-type FormValues = z.infer<typeof schema>;
+type ProjectFormValues = z.infer<typeof projectSchema>;
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
+const formatEUR = (n: number) =>
+  new Intl.NumberFormat("en-IE", {
+    style: "currency",
+    currency: "EUR",
+    minimumFractionDigits: 2,
+  }).format(n);
+
+function normalize(s: string) {
+  return (s ?? "").toLowerCase().trim();
 }
 
-function money(n: number) {
-  return new Intl.NumberFormat(undefined, { style: "currency", currency: "EUR" }).format(n);
-}
-
-function Card({ title, value, sub }: { title: string; value: string; sub?: string }) {
-  return (
-    <div style={{ border: "1px solid #eee", borderRadius: 14, padding: 14, background: "white" }}>
-      <div style={{ color: "#666", fontSize: 13 }}>{title}</div>
-      <div style={{ fontSize: 26, fontWeight: 700, marginTop: 6 }}>{value}</div>
-      {sub ? <div style={{ color: "#666", fontSize: 13, marginTop: 6 }}>{sub}</div> : null}
-    </div>
-  );
-}
-
-function Badge({ status }: { status: ProjectStatus }) {
-  const map: Record<ProjectStatus, { bg: string; text: string }> = {
-    ACTIVE: { bg: "#e8fff3", text: "#067647" },
-    PAUSED: { bg: "#fff7ed", text: "#9a3412" },
-    DONE: { bg: "#eef2ff", text: "#3730a3" },
-  };
-  const s = map[status];
-  return (
-    <span
-      style={{
-        padding: "4px 10px",
-        borderRadius: 999,
-        background: s.bg,
-        color: s.text,
-        fontSize: 12,
-        fontWeight: 700,
-        display: "inline-block",
-      }}
-    >
-      {status}
-    </span>
-  );
-}
-
-// Custom tooltip ca să nu se mai suprapună urât peste chart
-function BudgetTooltip({
-  active,
-  payload,
-  label,
-}: {
-  active?: boolean;
-  payload?: Array<{ name: string; value: number }>;
-  label?: string;
-}) {
-  if (!active || !payload || payload.length === 0) return null;
-
-  const budget = payload.find((p) => p.name === "budget")?.value ?? payload[0]?.value ?? 0;
-  const spent = payload.find((p) => p.name === "spent")?.value ?? payload[1]?.value ?? 0;
-
-  return (
-    <div
-      style={{
-        background: "white",
-        padding: "8px 12px",
-        border: "1px solid #ddd",
-        borderRadius: 8,
-        maxWidth: 200,
-        fontSize: 13,
-        lineHeight: 1.4,
-        boxShadow: "0 6px 24px rgba(0,0,0,0.08)",
-      }}
-    >
-      <div style={{ fontWeight: 700, marginBottom: 6 }}>{label}</div>
-      <div>budget: {money(budget)}</div>
-      <div>spent: {money(spent)}</div>
-    </div>
-  );
+function compare(a: any, b: any) {
+  if (a == null && b == null) return 0;
+  if (a == null) return -1;
+  if (b == null) return 1;
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  return String(a).localeCompare(String(b));
 }
 
 export default function DashboardPage() {
   const qc = useQueryClient();
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"ALL" | ProjectStatus>("ALL");
+  const [sortKey, setSortKey] = useState<SortKey>("createdAt");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
 
-  const { data, isLoading, isError, error } = useQuery({
-    queryKey: ["projects"],
-    queryFn: listProjects,
-  });
-
-  const [q, setQ] = useState("");
-  const [status, setStatus] = useState<ProjectStatus | "ALL">("ALL");
-  const [sort, setSort] = useState<"createdAt" | "budget" | "spent">("createdAt");
-  const [dir, setDir] = useState<"asc" | "desc">("desc");
   const [page, setPage] = useState(1);
-  const pageSize = 6;
+  const pageSize = 5;
 
-  const filteredSorted = useMemo(() => {
-    const items = (data ?? []).slice();
+  const projectsQuery = useQuery({
+    queryKey: ["projects"],
+    queryFn: async (): Promise<Project[]> => {
+      const res = await fetch(API_URL);
+      if (!res.ok) throw new Error(`Failed to fetch (${res.status})`);
+      return res.json();
+    },
+  });
 
-    const qq = q.trim().toLowerCase();
-    const filtered = items.filter((p) => {
-      const matchesQ =
-        !qq ||
-        p.name.toLowerCase().includes(qq) ||
-        p.owner.toLowerCase().includes(qq) ||
-        String(p.id).includes(qq);
-      const matchesStatus = status === "ALL" || p.status === status;
-      return matchesQ && matchesStatus;
-    });
-
-    filtered.sort((a, b) => {
-      const av =
-        sort === "createdAt"
-          ? new Date(a.createdAt).getTime()
-          : sort === "budget"
-          ? a.budget
-          : a.spent;
-      const bv =
-        sort === "createdAt"
-          ? new Date(b.createdAt).getTime()
-          : sort === "budget"
-          ? b.budget
-          : b.spent;
-
-      return dir === "asc" ? av - bv : bv - av;
-    });
-
-    return filtered;
-  }, [data, q, status, sort, dir]);
-
-  const totalPages = Math.max(1, Math.ceil(filteredSorted.length / pageSize));
-  const safePage = clamp(page, 1, totalPages);
-  const pageItems = filteredSorted.slice((safePage - 1) * pageSize, safePage * pageSize);
-
-  const kpis = useMemo(() => {
-    const items = filteredSorted;
-    const totalBudget = items.reduce((s, p) => s + p.budget, 0);
-    const totalSpent = items.reduce((s, p) => s + p.spent, 0);
-    const active = items.filter((p) => p.status === "ACTIVE").length;
-    const burn = totalBudget <= 0 ? 0 : Math.round((totalSpent / totalBudget) * 100);
-    return { totalBudget, totalSpent, active, burn };
-  }, [filteredSorted]);
-
-  const statusPie = useMemo(() => {
-    const counts = { ACTIVE: 0, PAUSED: 0, DONE: 0 };
-    for (const p of filteredSorted) counts[p.status]++;
-    return [
-      { name: "ACTIVE", value: counts.ACTIVE },
-      { name: "PAUSED", value: counts.PAUSED },
-      { name: "DONE", value: counts.DONE },
-    ];
-  }, [filteredSorted]);
-
-  const budgetBars = useMemo(() => {
-    // top 6 by budget
-    return filteredSorted
-      .slice()
-      .sort((a, b) => b.budget - a.budget)
-      .slice(0, 6)
-      .map((p) => ({ name: p.name, budget: p.budget, spent: p.spent }));
-  }, [filteredSorted]);
-
-  const createMut = useMutation({
-    mutationFn: createProject,
+  const createMutation = useMutation({
+    mutationFn: async (payload: Omit<Project, "id">) => {
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(`Create failed (${res.status})`);
+      return (await res.json()) as Project;
+    },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ["projects"] });
     },
   });
 
-  const delMut = useMutation({
-    mutationFn: deleteProject,
+  const deleteMutation = useMutation({
+    mutationFn: async (id: number) => {
+      const res = await fetch(`${API_URL}/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`Delete failed (${res.status})`);
+      return true;
+    },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ["projects"] });
     },
   });
 
-  const form = useForm<FormValues>({
-    resolver: zodResolver(schema),
+  const projects = projectsQuery.data ?? [];
+
+  const filteredProjects = useMemo(() => {
+    const q = normalize(query);
+
+    let list = projects.filter((p) => {
+      const matchesStatus = statusFilter === "ALL" ? true : p.status === statusFilter;
+
+      if (!q) return matchesStatus;
+
+      const hay = [
+        p.name,
+        p.owner,
+        String(p.id),
+        p.status,
+        String(p.budget ?? ""),
+        String(p.spent ?? ""),
+        p.createdAt,
+      ]
+        .map(normalize)
+        .join(" ");
+
+      return matchesStatus && hay.includes(q);
+    });
+
+    list = list.sort((a, b) => {
+      const av = (a as any)[sortKey];
+      const bv = (b as any)[sortKey];
+      const c = compare(av, bv);
+      return sortDir === "asc" ? c : -c;
+    });
+
+    return list;
+  }, [projects, query, statusFilter, sortKey, sortDir]);
+
+  const kpis: KPI[] = useMemo(() => calculateKPIs(filteredProjects), [filteredProjects]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredProjects.length / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const pagedProjects = useMemo(() => {
+    const start = (safePage - 1) * pageSize;
+    return filteredProjects.slice(start, start + pageSize);
+  }, [filteredProjects, safePage]);
+
+  React.useEffect(() => {
+    setPage(1);
+  }, [query, statusFilter, sortKey, sortDir]);
+
+  const today = new Date();
+  const yyyy = today.getFullYear();
+  const mm = String(today.getMonth() + 1).padStart(2, "0");
+  const dd = String(today.getDate()).padStart(2, "0");
+  const defaultDate = `${yyyy}-${mm}-${dd}`;
+
+  const form = useForm<ProjectFormValues>({
+    resolver: zodResolver(projectSchema),
     defaultValues: {
       name: "",
       owner: "Antoniu",
       status: "ACTIVE",
       budget: 0,
       spent: 0,
+      createdAt: defaultDate,
     },
+    mode: "onTouched",
   });
 
-  function onSubmit(values: FormValues) {
-    const createdAt = new Date().toISOString().slice(0, 10);
-    createMut.mutate({
-      name: values.name,
-      owner: values.owner,
-      status: values.status,
-      budget: values.budget,
-      spent: Math.min(values.spent, values.budget),
-      createdAt,
-    });
-    form.reset({ name: "", owner: values.owner, status: "ACTIVE", budget: 0, spent: 0 });
-  }
+  const errorMsg = (projectsQuery.error as Error)?.message ?? (createMutation.error as Error)?.message ?? (deleteMutation.error as Error)?.message;
+
+  const layoutStyles: React.CSSProperties = {
+    maxWidth: 1120,
+    margin: "0 auto",
+    padding: "28px 16px 60px",
+    fontFamily:
+      'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"',
+    color: "#0f172a",
+  };
+
+  const card: React.CSSProperties = {
+    background: "#fff",
+    border: "1px solid #EAECF0",
+    borderRadius: 14,
+    boxShadow: "0 1px 2px rgba(16, 24, 40, 0.06)",
+  };
+
+  const subtle: React.CSSProperties = { color: "#667085" };
 
   return (
-    <div style={{ maxWidth: 1200, margin: "0 auto", padding: 24, fontFamily: "system-ui" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+    <div style={layoutStyles}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
         <div>
-          <h1 style={{ margin: 0 }}>Projects Dashboard</h1>
-          <div style={{ color: "#666", marginTop: 6 }}>
-            React + TypeScript • TanStack Query • Forms + Validation • Charts
+          <h1 style={{ fontSize: 54, lineHeight: 1.05, margin: 0, letterSpacing: -1 }}>
+            Projects Dashboard
+          </h1>
+          <div style={{ marginTop: 8, ...subtle }}>
+            React • TypeScript • TanStack Query • Forms + Validation • Charts
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           <input
-            value={q}
-            onChange={(e) => {
-              setQ(e.target.value);
-              setPage(1);
-            }}
-            placeholder="Search by name / owner / id..."
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search by name / owner / id…"
             style={{
               padding: "10px 12px",
-              borderRadius: 10,
-              border: "1px solid #e5e7eb",
-              width: 280,
+              borderRadius: 12,
+              border: "1px solid #D0D5DD",
+              minWidth: 260,
+              outline: "none",
             }}
           />
 
           <select
-            value={status}
-            onChange={(e) => {
-              setStatus(e.target.value as any);
-              setPage(1);
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value as any)}
+            style={{
+              padding: "10px 12px",
+              borderRadius: 12,
+              border: "1px solid #D0D5DD",
+              outline: "none",
+              background: "white",
             }}
-            style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #e5e7eb" }}
           >
-            <option value="ALL">All statuses</option>
-            <option value="ACTIVE">ACTIVE</option>
-            <option value="PAUSED">PAUSED</option>
-            <option value="DONE">DONE</option>
+            {statusOptions.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
           </select>
 
           <select
-            value={sort}
-            onChange={(e) => setSort(e.target.value as any)}
-            style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #e5e7eb" }}
+            value={sortKey}
+            onChange={(e) => setSortKey(e.target.value as SortKey)}
+            style={{
+              padding: "10px 12px",
+              borderRadius: 12,
+              border: "1px solid #D0D5DD",
+              outline: "none",
+              background: "white",
+            }}
           >
-            <option value="createdAt">Sort: created date</option>
-            <option value="budget">Sort: budget</option>
-            <option value="spent">Sort: spent</option>
+            {sortOptions.map((o) => (
+              <option key={o.value} value={o.value}>
+                Sort: {o.label}
+              </option>
+            ))}
           </select>
 
           <button
-            onClick={() => setDir((d) => (d === "asc" ? "desc" : "asc"))}
-            style={{
-              padding: "10px 12px",
-              borderRadius: 10,
-              border: "1px solid #e5e7eb",
-              background: "white",
-            }}
+            onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}
             title="Toggle sort direction"
+            style={{
+              width: 44,
+              height: 40,
+              borderRadius: 12,
+              border: "1px solid #D0D5DD",
+              background: "white",
+              cursor: "pointer",
+              fontSize: 16,
+            }}
           >
-            {dir === "asc" ? "↑" : "↓"}
+            {sortDir === "asc" ? "↑" : "↓"}
           </button>
         </div>
       </div>
 
-      {/* KPIs */}
+      {errorMsg ? (
+        <div
+          style={{
+            marginTop: 16,
+            padding: "12px 14px",
+            borderRadius: 12,
+            border: "1px solid #FDA29B",
+            background: "#FEF3F2",
+            color: "#B42318",
+          }}
+        >
+          <strong>Error:</strong> {errorMsg}
+        </div>
+      ) : null}
+
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
-          gap: 12,
+          gridTemplateColumns: "repeat(4, minmax(180px, 1fr))",
+          gap: 14,
           marginTop: 18,
         }}
       >
-        <Card title="Total Budget" value={money(kpis.totalBudget)} />
-        <Card title="Total Spent" value={money(kpis.totalSpent)} />
-        <Card title="Active Projects" value={String(kpis.active)} sub="Filter affects KPIs" />
-        <Card title="Burn Rate" value={`${kpis.burn}%`} sub="spent / budget" />
+        {kpis.map((k) => (
+          <div key={k.label} style={{ ...card, padding: 16 }}>
+            <div style={{ ...subtle, fontSize: 13 }}>{k.label}</div>
+            <div style={{ fontSize: 30, fontWeight: 800, marginTop: 6 }}>{k.value}</div>
+            {k.label === "Active Projects" ? (
+              <div style={{ marginTop: 6, ...subtle, fontSize: 12 }}>Filter affects KPIs</div>
+            ) : null}
+            {k.label === "Burn Rate" ? (
+              <div style={{ marginTop: 6, ...subtle, fontSize: 12 }}>spent / budget</div>
+            ) : null}
+          </div>
+        ))}
       </div>
 
-      {/* Main grid */}
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "2fr 1fr",
-          gap: 12,
-          marginTop: 12,
+          gridTemplateColumns: "1.6fr 1fr",
+          gap: 16,
+          marginTop: 16,
           alignItems: "start",
         }}
       >
-        {/* Table */}
-        <div style={{ border: "1px solid #eee", borderRadius: 14, padding: 14, background: "white" }}>
+        <div style={{ ...card, padding: 16 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-            <h2 style={{ margin: 0 }}>Projects</h2>
-            <div style={{ color: "#666", fontSize: 13 }}>
-              Showing {filteredSorted.length} • Page {safePage}/{totalPages}
+            <h2 style={{ margin: 0, fontSize: 28 }}>Projects</h2>
+            <div style={{ ...subtle, fontSize: 13 }}>
+              Showing {filteredProjects.length} • Page {safePage}/{totalPages}
             </div>
           </div>
 
-          {isLoading ? (
-            <div style={{ padding: 18, color: "#666" }}>Loading...</div>
-          ) : isError ? (
-            <div style={{ padding: 18, color: "#b91c1c" }}>
-              Failed to load projects: {(error as any)?.message || String(error)}
-            </div>
-          ) : pageItems.length === 0 ? (
-            <div style={{ padding: 18, color: "#666" }}>No projects match your filters.</div>
-          ) : (
-            <div style={{ marginTop: 12, overflowX: "auto" }}>
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr style={{ textAlign: "left", color: "#666", fontSize: 13 }}>
-                    <th style={{ padding: "10px 8px", borderBottom: "1px solid #eee" }}>Name</th>
-                    <th style={{ padding: "10px 8px", borderBottom: "1px solid #eee" }}>Owner</th>
-                    <th style={{ padding: "10px 8px", borderBottom: "1px solid #eee" }}>Status</th>
-                    <th style={{ padding: "10px 8px", borderBottom: "1px solid #eee" }}>Budget</th>
-                    <th style={{ padding: "10px 8px", borderBottom: "1px solid #eee" }}>Spent</th>
-                    <th style={{ padding: "10px 8px", borderBottom: "1px solid #eee" }}>Created</th>
-                    <th style={{ padding: "10px 8px", borderBottom: "1px solid #eee" }}></th>
+          <div style={{ marginTop: 12, overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 680 }}>
+              <thead>
+                <tr style={{ textAlign: "left" }}>
+                  {["Name", "Owner", "Status", "Budget", "Spent", "Created", ""].map((h) => (
+                    <th
+                      key={h}
+                      style={{
+                        fontSize: 12,
+                        letterSpacing: 0.4,
+                        textTransform: "none",
+                        color: "#344054",
+                        padding: "10px 8px",
+                        borderBottom: "1px solid #EAECF0",
+                      }}
+                    >
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {projectsQuery.isLoading ? (
+                  <tr>
+                    <td colSpan={7} style={{ padding: 14, ...subtle }}>
+                      Loading…
+                    </td>
                   </tr>
-                </thead>
-                <tbody>
-                  {pageItems.map((p) => (
+                ) : pagedProjects.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} style={{ padding: 14, ...subtle }}>
+                      No projects found.
+                    </td>
+                  </tr>
+                ) : (
+                  pagedProjects.map((p) => (
                     <tr key={p.id}>
-                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #f3f4f6", fontWeight: 700 }}>
-                        {p.name}
+                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #F2F4F7" }}>
+                        <div style={{ fontWeight: 700 }}>{p.name}</div>
                       </td>
-                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #f3f4f6" }}>{p.owner}</td>
-                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #f3f4f6" }}>
-                        <Badge status={p.status} />
+                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #F2F4F7" }}>
+                        {p.owner}
                       </td>
-                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #f3f4f6" }}>{money(p.budget)}</td>
-                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #f3f4f6" }}>{money(p.spent)}</td>
-                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #f3f4f6" }}>{p.createdAt}</td>
-                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #f3f4f6" }}>
-                        <button
-                          onClick={() => delMut.mutate(p.id)}
-                          disabled={delMut.isPending}
+                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #F2F4F7" }}>
+                        <span
                           style={{
-                            padding: "8px 10px",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 8,
+                            padding: "4px 10px",
+                            borderRadius: 999,
+                            fontSize: 12,
+                            fontWeight: 700,
+                            border: "1px solid #EAECF0",
+                            background:
+                              p.status === "ACTIVE"
+                                ? "#ECFDF3"
+                                : p.status === "PAUSED"
+                                ? "#FFF6ED"
+                                : "#EEF4FF",
+                            color:
+                              p.status === "ACTIVE"
+                                ? "#027A48"
+                                : p.status === "PAUSED"
+                                ? "#B54708"
+                                : "#3538CD",
+                          }}
+                        >
+                          {p.status}
+                        </span>
+                      </td>
+                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #F2F4F7" }}>
+                        {formatEUR(p.budget ?? 0)}
+                      </td>
+                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #F2F4F7" }}>
+                        {formatEUR(p.spent ?? 0)}
+                      </td>
+                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #F2F4F7" }}>
+                        {p.createdAt}
+                      </td>
+                      <td style={{ padding: "10px 8px", borderBottom: "1px solid #F2F4F7" }}>
+                        <button
+                          onClick={() => deleteMutation.mutate(p.id)}
+                          disabled={deleteMutation.isPending}
+                          style={{
+                            padding: "8px 12px",
                             borderRadius: 10,
-                            border: "1px solid #eee",
+                            border: "1px solid #D0D5DD",
                             background: "white",
                             cursor: "pointer",
                           }}
@@ -374,170 +424,219 @@ export default function DashboardPage() {
                         </button>
                       </td>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
 
-          {/* Pagination */}
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 12 }}>
+          <div
+            style={{
+              marginTop: 12,
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 10,
+            }}
+          >
             <button
               onClick={() => setPage((p) => Math.max(1, p - 1))}
               disabled={safePage <= 1}
-              style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #eee", background: "white" }}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 12,
+                border: "1px solid #D0D5DD",
+                background: "white",
+                cursor: "pointer",
+                opacity: safePage <= 1 ? 0.5 : 1,
+              }}
             >
               Prev
             </button>
-
-            <div style={{ color: "#666", fontSize: 13 }}>
+            <div style={{ ...subtle, fontSize: 13 }}>
               Page {safePage} of {totalPages}
             </div>
-
             <button
               onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
               disabled={safePage >= totalPages}
-              style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #eee", background: "white" }}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 12,
+                border: "1px solid #D0D5DD",
+                background: "white",
+                cursor: "pointer",
+                opacity: safePage >= totalPages ? 0.5 : 1,
+              }}
             >
               Next
             </button>
           </div>
         </div>
 
-        {/* Right column: Create + charts */}
-        <div style={{ display: "grid", gap: 12 }}>
-          {/* Create form */}
-          <div style={{ border: "1px solid #eee", borderRadius: 14, padding: 14, background: "white" }}>
-            <h2 style={{ marginTop: 0 }}>Create project</h2>
+        <div style={{ ...card, padding: 16 }}>
+          <h2 style={{ margin: 0, fontSize: 28 }}>Create project</h2>
 
-            <form onSubmit={form.handleSubmit(onSubmit)} style={{ display: "grid", gap: 10 }}>
-              <div style={{ display: "grid", gap: 6 }}>
-                <label>Name</label>
-                <input
-                  {...form.register("name")}
-                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #e5e7eb" }}
-                />
-                {form.formState.errors.name?.message ? (
-                  <div style={{ color: "#b91c1c", fontSize: 12 }}>{form.formState.errors.name.message}</div>
-                ) : null}
-              </div>
-
-              <div style={{ display: "grid", gap: 6 }}>
-                <label>Owner</label>
-                <input
-                  {...form.register("owner")}
-                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #e5e7eb" }}
-                />
-                {form.formState.errors.owner?.message ? (
-                  <div style={{ color: "#b91c1c", fontSize: 12 }}>{form.formState.errors.owner.message}</div>
-                ) : null}
-              </div>
-
-              <div style={{ display: "grid", gap: 6 }}>
-                <label>Status</label>
-                <select
-                  {...form.register("status")}
-                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #e5e7eb" }}
-                >
-                  <option value="ACTIVE">ACTIVE</option>
-                  <option value="PAUSED">PAUSED</option>
-                  <option value="DONE">DONE</option>
-                </select>
-              </div>
-
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-                <div style={{ display: "grid", gap: 6 }}>
-                  <label>Budget</label>
-                  <input
-                    type="number"
-                    step="1"
-                    {...form.register("budget")}
-                    style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #e5e7eb" }}
-                  />
-                  {form.formState.errors.budget?.message ? (
-                    <div style={{ color: "#b91c1c", fontSize: 12 }}>{form.formState.errors.budget.message}</div>
-                  ) : null}
-                </div>
-
-                <div style={{ display: "grid", gap: 6 }}>
-                  <label>Spent</label>
-                  <input
-                    type="number"
-                    step="1"
-                    {...form.register("spent")}
-                    style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #e5e7eb" }}
-                  />
-                  {form.formState.errors.spent?.message ? (
-                    <div style={{ color: "#b91c1c", fontSize: 12 }}>{form.formState.errors.spent.message}</div>
-                  ) : null}
-                </div>
-              </div>
-
-              <button
-                type="submit"
-                disabled={createMut.isPending}
+          <form
+            onSubmit={form.handleSubmit((values) => {
+              const payload: Omit<Project, "id"> = {
+                ...values,
+                budget: Number(values.budget),
+                spent: Number(values.spent),
+              };
+              createMutation.mutate(payload);
+              form.reset({
+                name: "",
+                owner: values.owner,
+                status: values.status,
+                budget: 0,
+                spent: 0,
+                createdAt: values.createdAt,
+              });
+            })}
+            style={{ marginTop: 12, display: "grid", gap: 10 }}
+          >
+            <div>
+              <label style={{ fontSize: 12, color: "#344054" }}>Name</label>
+              <input
+                {...form.register("name")}
                 style={{
+                  width: "100%",
                   padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #111827",
-                  background: "#111827",
-                  color: "white",
-                  cursor: "pointer",
+                  borderRadius: 12,
+                  border: "1px solid #D0D5DD",
+                  outline: "none",
                 }}
-              >
-                {createMut.isPending ? "Creating..." : "Create"}
-              </button>
-
-              {createMut.isError ? (
-                <div style={{ color: "#b91c1c", fontSize: 12 }}>
-                  {(createMut.error as any)?.message || "Failed to create"}
+              />
+              {form.formState.errors.name ? (
+                <div style={{ color: "#B42318", fontSize: 12, marginTop: 4 }}>
+                  {form.formState.errors.name.message}
                 </div>
               ) : null}
-            </form>
-          </div>
-
-          {/* Charts */}
-          <div style={{ border: "1px solid #eee", borderRadius: 14, padding: 14, background: "white" }}>
-            <h2 style={{ marginTop: 0 }}>Charts</h2>
-
-            <div style={{ height: 180 }}>
-              <div style={{ fontSize: 13, color: "#666", marginBottom: 8 }}>Status distribution</div>
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie data={statusPie} dataKey="value" nameKey="name" outerRadius={70} />
-                  <Tooltip />
-                </PieChart>
-              </ResponsiveContainer>
             </div>
 
-            <div style={{ height: 240, marginTop: 14 }}>
-              <div style={{ fontSize: 13, color: "#666", marginBottom: 8 }}>Top budgets (budget vs spent)</div>
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart
-                  data={budgetBars}
-                  margin={{ top: 24, right: 56, left: 10, bottom: 40 }}
-                >
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="name" tick={{ fontSize: 12 }} interval={0} />
-                  <YAxis />
-                  <Tooltip content={<BudgetTooltip />} />
-                  <Legend />
-                  <Bar dataKey="budget" />
-                  <Bar dataKey="spent" />
-                </BarChart>
-              </ResponsiveContainer>
+            <div>
+              <label style={{ fontSize: 12, color: "#344054" }}>Owner</label>
+              <input
+                {...form.register("owner")}
+                style={{
+                  width: "100%",
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: "1px solid #D0D5DD",
+                  outline: "none",
+                }}
+              />
+              {form.formState.errors.owner ? (
+                <div style={{ color: "#B42318", fontSize: 12, marginTop: 4 }}>
+                  {form.formState.errors.owner.message}
+                </div>
+              ) : null}
             </div>
 
-            <div style={{ color: "#666", fontSize: 12, marginTop: 8 }}>
-              Charts update with filters/search because they are computed from the same dataset.
+            <div>
+              <label style={{ fontSize: 12, color: "#344054" }}>Status</label>
+              <select
+                {...form.register("status")}
+                style={{
+                  width: "100%",
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: "1px solid #D0D5DD",
+                  outline: "none",
+                  background: "white",
+                }}
+              >
+                <option value="ACTIVE">ACTIVE</option>
+                <option value="PAUSED">PAUSED</option>
+                <option value="DONE">DONE</option>
+              </select>
             </div>
-          </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <div>
+                <label style={{ fontSize: 12, color: "#344054" }}>Budget</label>
+                <input
+                  type="number"
+                  step="1"
+                  {...form.register("budget")}
+                  style={{
+                    width: "100%",
+                    padding: "10px 12px",
+                    borderRadius: 12,
+                    border: "1px solid #D0D5DD",
+                    outline: "none",
+                  }}
+                />
+                {form.formState.errors.budget ? (
+                  <div style={{ color: "#B42318", fontSize: 12, marginTop: 4 }}>
+                    {form.formState.errors.budget.message}
+                  </div>
+                ) : null}
+              </div>
+
+              <div>
+                <label style={{ fontSize: 12, color: "#344054" }}>Spent</label>
+                <input
+                  type="number"
+                  step="1"
+                  {...form.register("spent")}
+                  style={{
+                    width: "100%",
+                    padding: "10px 12px",
+                    borderRadius: 12,
+                    border: "1px solid #D0D5DD",
+                    outline: "none",
+                  }}
+                />
+                {form.formState.errors.spent ? (
+                  <div style={{ color: "#B42318", fontSize: 12, marginTop: 4 }}>
+                    {form.formState.errors.spent.message}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
+            <div>
+              <label style={{ fontSize: 12, color: "#344054" }}>Created (YYYY-MM-DD)</label>
+              <input
+                {...form.register("createdAt")}
+                placeholder="2026-01-05"
+                style={{
+                  width: "100%",
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: "1px solid #D0D5DD",
+                  outline: "none",
+                }}
+              />
+              {form.formState.errors.createdAt ? (
+                <div style={{ color: "#B42318", fontSize: 12, marginTop: 4 }}>
+                  {form.formState.errors.createdAt.message}
+                </div>
+              ) : null}
+            </div>
+
+            <button
+              type="submit"
+              disabled={createMutation.isPending}
+              style={{
+                marginTop: 4,
+                padding: "12px 14px",
+                borderRadius: 12,
+                border: "1px solid #0B1220",
+                background: "#0B1220",
+                color: "white",
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              {createMutation.isPending ? "Creating…" : "Create"}
+            </button>
+          </form>
         </div>
       </div>
 
-      <div style={{ color: "#666", fontSize: 12, marginTop: 14 }}>
-        API: json-server on <code>http://localhost:8081</code> • Data via TanStack Query
-      </div>
+      <ChartsPanel projects={filteredProjects} />
     </div>
   );
 }
